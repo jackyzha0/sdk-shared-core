@@ -1,18 +1,19 @@
 use crate::error::CommandMetadata;
 use crate::retries::NextRetry;
 use crate::service_protocol::messages::{
-    get_eager_state_command_message, propose_run_completion_message, CommandMessageHeaderDiff,
-    CommandMessageHeaderEq, ErrorBehavior, GetEagerStateCommandMessage,
-    GetEagerStateKeysCommandMessage, GetLazyStateCommandMessage, GetLazyStateKeysCommandMessage,
-    InputCommandMessage, NamedCommandMessage, ProposeRunCompletionMessage, RestateEncodableMessage,
-    RestateMessage, RunCommandMessage, StateKeys, Void,
+    get_eager_state_command_message, propose_run_completion_message, ClearAllStateCommandMessage,
+    ClearStateCommandMessage, CommandMessageHeaderDiff, CommandMessageHeaderEq, ErrorBehavior,
+    GetEagerStateCommandMessage, GetEagerStateKeysCommandMessage, GetLazyStateCommandMessage,
+    GetLazyStateKeysCommandMessage, InputCommandMessage, NamedCommandMessage,
+    ProposeRunCompletionMessage, RestateEncodableMessage, RestateMessage, RunCommandMessage,
+    SetStateCommandMessage, StateKeys, Void,
 };
 use crate::service_protocol::{
     messages, CompletionId, MessageType, Notification, NotificationId, NotificationResult,
     RawMessage,
 };
 use crate::vm::async_results_state::AsyncResultsState;
-use crate::vm::context::{Context, EagerGetState, EagerGetStateKeys};
+use crate::vm::context::{Context, EagerGetState, EagerGetStateKeys, EagerState};
 use crate::vm::errors::{
     CommandMismatchError, CommandTypeMismatchError, UnavailableEntryError, EMPTY_GET_EAGER_STATE,
     EMPTY_GET_EAGER_STATE_KEYS,
@@ -313,12 +314,13 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
             State::Processing {
                 ref mut processing_first_entry,
                 ref mut async_results,
+                ref eager_state,
                 ..
             } => {
                 *processing_first_entry = false;
 
                 // Let's look into the eager_state
-                let result = match context.eager_state.get(&key) {
+                let result = match eager_state.get(&key) {
                     EagerGetState::Unknown => None,
                     EagerGetState::Empty => Some((
                         get_eager_state_command_message::Result::Void(Void::default()),
@@ -364,26 +366,31 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
                 }
             }
             State::Replaying {
-                commands,
-                async_results,
+                mut commands,
+                mut async_results,
                 run_state,
+                eager_state,
             } => {
                 context
                     .journal
                     .transition(&GetEagerStateCommandMessage::default());
 
-                process_get_entry_during_replay(
+                let handle = process_get_entry_during_replay(
                     context,
                     key,
                     completion_id,
-                    commands,
-                    async_results,
-                    run_state,
+                    &mut commands,
+                    &mut async_results,
                     options,
                 )
                 .map_err(|e| {
                     e.with_related_command_metadata(context.journal.last_command_metadata())
-                })
+                })?;
+
+                Ok((
+                    replaying_or_processing(commands, run_state, async_results, eager_state),
+                    handle,
+                ))
             }
             s => Err(s
                 .as_unexpected_state(CommandType::GetState)
@@ -397,15 +404,37 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
     }
 }
 
+fn replaying_or_processing(
+    commands: VecDeque<RawMessage>,
+    run_state: RunState,
+    async_results: AsyncResultsState,
+    eager_state: EagerState,
+) -> State {
+    if commands.is_empty() {
+        State::Processing {
+            processing_first_entry: true,
+            run_state,
+            async_results,
+            eager_state,
+        }
+    } else {
+        State::Replaying {
+            commands,
+            run_state,
+            async_results,
+            eager_state,
+        }
+    }
+}
+
 fn process_get_entry_during_replay(
     context: &mut Context,
     key: String,
     completion_id: u32,
-    mut commands: VecDeque<RawMessage>,
-    mut async_results: AsyncResultsState,
-    run_state: RunState,
+    commands: &mut VecDeque<RawMessage>,
+    async_results: &mut AsyncResultsState,
     options: PayloadOptions,
-) -> Result<(State, NotificationHandle), Error> {
+) -> Result<NotificationHandle, Error> {
     let handle = async_results.create_handle_mapping(NotificationId::CompletionId(completion_id));
     let ignore_payload_equality = should_ignore_payload_equality(
         context.non_deterministic_checks_ignore_payload_equality,
@@ -470,20 +499,7 @@ fn process_get_entry_during_replay(
         }
     }
 
-    let new_state = if commands.is_empty() {
-        State::Processing {
-            processing_first_entry: true,
-            run_state,
-            async_results,
-        }
-    } else {
-        State::Replaying {
-            commands,
-            run_state,
-            async_results,
-        }
-    };
-    Ok((new_state, handle))
+    Ok(handle)
 }
 
 pub(crate) struct SysStateGetKeys;
@@ -502,12 +518,13 @@ impl TransitionAndReturn<Context, SysStateGetKeys> for State {
             State::Processing {
                 ref mut processing_first_entry,
                 ref mut async_results,
+                ref eager_state,
                 ..
             } => {
                 *processing_first_entry = false;
 
                 // Let's look into the eager_state
-                let result = match context.eager_state.get_keys() {
+                let result = match eager_state.get_keys() {
                     EagerGetStateKeys::Unknown => None,
                     EagerGetStateKeys::Keys(keys) => {
                         let state_keys = StateKeys {
@@ -552,24 +569,29 @@ impl TransitionAndReturn<Context, SysStateGetKeys> for State {
                 }
             }
             State::Replaying {
-                commands,
-                async_results,
+                mut commands,
+                mut async_results,
                 run_state,
+                eager_state,
             } => {
                 context
                     .journal
                     .transition(&GetEagerStateKeysCommandMessage::default());
 
-                process_get_entry_keys_during_replay(
+                let handle = process_get_entry_keys_during_replay(
                     context,
                     completion_id,
-                    commands,
-                    async_results,
-                    run_state,
+                    &mut commands,
+                    &mut async_results,
                 )
                 .map_err(|e| {
                     e.with_related_command_metadata(context.journal.last_command_metadata())
-                })
+                })?;
+
+                Ok((
+                    replaying_or_processing(commands, run_state, async_results, eager_state),
+                    handle,
+                ))
             }
             s => Err(s
                 .as_unexpected_state(CommandType::GetStateKeys)
@@ -586,10 +608,9 @@ impl TransitionAndReturn<Context, SysStateGetKeys> for State {
 fn process_get_entry_keys_during_replay(
     context: &mut Context,
     completion_id: u32,
-    mut commands: VecDeque<RawMessage>,
-    mut async_results: AsyncResultsState,
-    run_state: RunState,
-) -> Result<(State, NotificationHandle), Error> {
+    commands: &mut VecDeque<RawMessage>,
+    async_results: &mut AsyncResultsState,
+) -> Result<NotificationHandle, Error> {
     let handle = async_results.create_handle_mapping(NotificationId::CompletionId(completion_id));
     // State keys don't contain payload bytes, so we only use the global flag
     let ignore_payload_equality = context.non_deterministic_checks_ignore_payload_equality;
@@ -648,21 +669,110 @@ fn process_get_entry_keys_during_replay(
         }
     }
 
-    let new_state = if commands.is_empty() {
-        State::Processing {
-            processing_first_entry: true,
-            run_state,
-            async_results,
-        }
-    } else {
-        State::Replaying {
-            commands,
-            run_state,
-            async_results,
-        }
-    };
+    Ok(handle)
+}
 
-    Ok((new_state, handle))
+pub(crate) struct SysStateSet(
+    pub(crate) String,
+    pub(crate) Bytes,
+    pub(crate) PayloadOptions,
+);
+
+impl Transition<Context, SysStateSet> for State {
+    fn transition(
+        self,
+        context: &mut Context,
+        SysStateSet(key, value, options): SysStateSet,
+    ) -> Result<Self, Error> {
+        let mut s = self.transition(
+            context,
+            SysNonCompletableEntry(
+                SetStateCommandMessage {
+                    key: Bytes::copy_from_slice(key.as_bytes()),
+                    value: Some(value.clone().into()),
+                    ..SetStateCommandMessage::default()
+                },
+                options,
+            ),
+        )?;
+        match s {
+            State::Replaying {
+                ref mut eager_state,
+                ..
+            }
+            | State::Processing {
+                ref mut eager_state,
+                ..
+            } => {
+                eager_state.set(key, value);
+                Ok(s)
+            }
+            s => Err(s.as_unexpected_state(SetStateCommandMessage::ty())),
+        }
+    }
+}
+
+pub(crate) struct SysStateClear(pub(crate) String);
+
+impl Transition<Context, SysStateClear> for State {
+    fn transition(
+        self,
+        context: &mut Context,
+        SysStateClear(key): SysStateClear,
+    ) -> Result<Self, Error> {
+        let mut s = self.transition(
+            context,
+            SysNonCompletableEntry(
+                ClearStateCommandMessage {
+                    key: Bytes::copy_from_slice(key.as_bytes()),
+                    ..ClearStateCommandMessage::default()
+                },
+                PayloadOptions::default(),
+            ),
+        )?;
+        match s {
+            State::Replaying {
+                ref mut eager_state,
+                ..
+            }
+            | State::Processing {
+                ref mut eager_state,
+                ..
+            } => {
+                eager_state.clear(key);
+                Ok(s)
+            }
+            s => Err(s.as_unexpected_state(ClearStateCommandMessage::ty())),
+        }
+    }
+}
+
+pub(crate) struct SysStateClearAll;
+
+impl Transition<Context, SysStateClearAll> for State {
+    fn transition(self, context: &mut Context, _: SysStateClearAll) -> Result<Self, Error> {
+        let mut s = self.transition(
+            context,
+            SysNonCompletableEntry(
+                ClearAllStateCommandMessage::default(),
+                PayloadOptions::default(),
+            ),
+        )?;
+        match s {
+            State::Replaying {
+                ref mut eager_state,
+                ..
+            }
+            | State::Processing {
+                ref mut eager_state,
+                ..
+            } => {
+                eager_state.clear_all();
+                Ok(s)
+            }
+            s => Err(s.as_unexpected_state(ClearAllStateCommandMessage::ty())),
+        }
+    }
 }
 
 pub(crate) struct SysRun(pub(crate) String);
@@ -756,6 +866,7 @@ impl Transition<Context, ProposeRunCompletion> for State {
                 ref mut async_results,
                 ref mut run_state,
                 processing_first_entry,
+                ..
             } => {
                 let notification_id =
                     async_results.must_resolve_notification_handle(&notification_handle);
@@ -873,24 +984,14 @@ impl<M: RestateMessage + CommandMessageHeaderEq + CommandMessageHeaderDiff + Clo
                 mut commands,
                 run_state,
                 async_results,
+                eager_state,
             } => {
                 let actual = commands
                     .pop_front()
                     .ok_or(UnavailableEntryError::new(M::ty()))?
                     .decode_to::<M>(context.journal.command_index())?;
-                let new_state = if commands.is_empty() {
-                    State::Processing {
-                        processing_first_entry: true,
-                        run_state,
-                        async_results,
-                    }
-                } else {
-                    State::Replaying {
-                        commands,
-                        run_state,
-                        async_results,
-                    }
-                };
+                let new_state =
+                    replaying_or_processing(commands, run_state, async_results, eager_state);
 
                 let ignore_payload_equality = should_ignore_payload_equality(
                     context.non_deterministic_checks_ignore_payload_equality,
