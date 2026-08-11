@@ -74,6 +74,25 @@ impl State {
         }
         UnexpectedStateError::new(self.into(), event.to_string()).into()
     }
+
+    /// Tries to transition to Processing when the condition is met, in all the other cases returns the current state.
+    #[inline]
+    fn try_transition_to_processing(self) -> Self {
+        match self {
+            State::Replaying {
+                commands,
+                async_results,
+                eager_state,
+                run_state,
+            } if commands.is_empty() => State::Processing {
+                processing_first_entry: true,
+                run_state,
+                async_results,
+                eager_state,
+            },
+            s => s,
+        }
+    }
 }
 
 struct TrackedInvocationId {

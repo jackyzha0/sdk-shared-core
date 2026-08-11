@@ -13,12 +13,11 @@ use crate::service_protocol::{
     RawMessage,
 };
 use crate::vm::async_results_state::AsyncResultsState;
-use crate::vm::context::{Context, EagerGetState, EagerGetStateKeys, EagerState};
+use crate::vm::context::{Context, EagerGetState, EagerGetStateKeys};
 use crate::vm::errors::{
     CommandMismatchError, CommandTypeMismatchError, UnavailableEntryError, EMPTY_GET_EAGER_STATE,
     EMPTY_GET_EAGER_STATE_KEYS,
 };
-use crate::vm::run_state::RunState;
 use crate::vm::transitions::{Transition, TransitionAndReturn};
 use crate::vm::State;
 use crate::{
@@ -366,10 +365,9 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
                 }
             }
             State::Replaying {
-                mut commands,
-                mut async_results,
-                run_state,
-                eager_state,
+                ref mut commands,
+                ref mut async_results,
+                ..
             } => {
                 context
                     .journal
@@ -379,18 +377,15 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
                     context,
                     key,
                     completion_id,
-                    &mut commands,
-                    &mut async_results,
+                    commands,
+                    async_results,
                     options,
                 )
                 .map_err(|e| {
                     e.with_related_command_metadata(context.journal.last_command_metadata())
                 })?;
 
-                Ok((
-                    replaying_or_processing(commands, run_state, async_results, eager_state),
-                    handle,
-                ))
+                Ok((self.try_transition_to_processing(), handle))
             }
             s => Err(s
                 .as_unexpected_state(CommandType::GetState)
@@ -400,29 +395,6 @@ impl TransitionAndReturn<Context, SysStateGet> for State {
                         name: None,
                     },
                 ))),
-        }
-    }
-}
-
-fn replaying_or_processing(
-    commands: VecDeque<RawMessage>,
-    run_state: RunState,
-    async_results: AsyncResultsState,
-    eager_state: EagerState,
-) -> State {
-    if commands.is_empty() {
-        State::Processing {
-            processing_first_entry: true,
-            run_state,
-            async_results,
-            eager_state,
-        }
-    } else {
-        State::Replaying {
-            commands,
-            run_state,
-            async_results,
-            eager_state,
         }
     }
 }
@@ -569,10 +541,9 @@ impl TransitionAndReturn<Context, SysStateGetKeys> for State {
                 }
             }
             State::Replaying {
-                mut commands,
-                mut async_results,
-                run_state,
-                eager_state,
+                ref mut commands,
+                ref mut async_results,
+                ..
             } => {
                 context
                     .journal
@@ -581,17 +552,14 @@ impl TransitionAndReturn<Context, SysStateGetKeys> for State {
                 let handle = process_get_entry_keys_during_replay(
                     context,
                     completion_id,
-                    &mut commands,
-                    &mut async_results,
+                    commands,
+                    async_results,
                 )
                 .map_err(|e| {
                     e.with_related_command_metadata(context.journal.last_command_metadata())
                 })?;
 
-                Ok((
-                    replaying_or_processing(commands, run_state, async_results, eager_state),
-                    handle,
-                ))
+                Ok((self.try_transition_to_processing(), handle))
             }
             s => Err(s
                 .as_unexpected_state(CommandType::GetStateKeys)
@@ -975,23 +943,19 @@ impl<M: RestateMessage + CommandMessageHeaderEq + CommandMessageHeaderDiff + Clo
     type Output = M;
 
     fn transition_and_return(
-        self,
+        mut self,
         context: &mut Context,
         PopJournalEntry(expected, options): PopJournalEntry<M>,
     ) -> Result<(Self, Self::Output), Error> {
         match self {
             State::Replaying {
-                mut commands,
-                run_state,
-                async_results,
-                eager_state,
+                ref mut commands, ..
             } => {
                 let actual = commands
                     .pop_front()
                     .ok_or(UnavailableEntryError::new(M::ty()))?
                     .decode_to::<M>(context.journal.command_index())?;
-                let new_state =
-                    replaying_or_processing(commands, run_state, async_results, eager_state);
+                let new_state = self.try_transition_to_processing();
 
                 let ignore_payload_equality = should_ignore_payload_equality(
                     context.non_deterministic_checks_ignore_payload_equality,
