@@ -93,6 +93,16 @@ impl State {
             s => s,
         }
     }
+
+    #[inline]
+    fn eager_state_mut(&mut self) -> Option<&mut EagerState> {
+        match self {
+            State::WaitingReplayEntries { eager_state, .. }
+            | State::Replaying { eager_state, .. }
+            | State::Processing { eager_state, .. } => Some(eager_state),
+            _ => None,
+        }
+    }
 }
 
 struct TrackedInvocationId {

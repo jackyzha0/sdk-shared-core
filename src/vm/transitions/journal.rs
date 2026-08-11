@@ -648,35 +648,24 @@ pub(crate) struct SysStateSet(
 
 impl Transition<Context, SysStateSet> for State {
     fn transition(
-        self,
+        mut self,
         context: &mut Context,
         SysStateSet(key, value, options): SysStateSet,
     ) -> Result<Self, Error> {
-        let mut s = self.transition(
+        if let Some(eager_state) = self.eager_state_mut() {
+            eager_state.set(key.clone(), value.clone());
+        }
+        self.transition(
             context,
             SysNonCompletableEntry(
                 SetStateCommandMessage {
-                    key: Bytes::copy_from_slice(key.as_bytes()),
-                    value: Some(value.clone().into()),
+                    key: key.into_bytes().into(),
+                    value: Some(value.into()),
                     ..SetStateCommandMessage::default()
                 },
                 options,
             ),
-        )?;
-        match s {
-            State::Replaying {
-                ref mut eager_state,
-                ..
-            }
-            | State::Processing {
-                ref mut eager_state,
-                ..
-            } => {
-                eager_state.set(key, value);
-                Ok(s)
-            }
-            s => Err(s.as_unexpected_state(SetStateCommandMessage::ty())),
-        }
+        )
     }
 }
 
@@ -684,62 +673,40 @@ pub(crate) struct SysStateClear(pub(crate) String);
 
 impl Transition<Context, SysStateClear> for State {
     fn transition(
-        self,
+        mut self,
         context: &mut Context,
         SysStateClear(key): SysStateClear,
     ) -> Result<Self, Error> {
-        let mut s = self.transition(
+        if let Some(eager_state) = self.eager_state_mut() {
+            eager_state.clear(key.clone());
+        }
+        self.transition(
             context,
             SysNonCompletableEntry(
                 ClearStateCommandMessage {
-                    key: Bytes::copy_from_slice(key.as_bytes()),
+                    key: key.into_bytes().into(),
                     ..ClearStateCommandMessage::default()
                 },
                 PayloadOptions::default(),
             ),
-        )?;
-        match s {
-            State::Replaying {
-                ref mut eager_state,
-                ..
-            }
-            | State::Processing {
-                ref mut eager_state,
-                ..
-            } => {
-                eager_state.clear(key);
-                Ok(s)
-            }
-            s => Err(s.as_unexpected_state(ClearStateCommandMessage::ty())),
-        }
+        )
     }
 }
 
 pub(crate) struct SysStateClearAll;
 
 impl Transition<Context, SysStateClearAll> for State {
-    fn transition(self, context: &mut Context, _: SysStateClearAll) -> Result<Self, Error> {
-        let mut s = self.transition(
+    fn transition(mut self, context: &mut Context, _: SysStateClearAll) -> Result<Self, Error> {
+        if let Some(eager_state) = self.eager_state_mut() {
+            eager_state.clear_all();
+        }
+        self.transition(
             context,
             SysNonCompletableEntry(
                 ClearAllStateCommandMessage::default(),
                 PayloadOptions::default(),
             ),
-        )?;
-        match s {
-            State::Replaying {
-                ref mut eager_state,
-                ..
-            }
-            | State::Processing {
-                ref mut eager_state,
-                ..
-            } => {
-                eager_state.clear_all();
-                Ok(s)
-            }
-            s => Err(s.as_unexpected_state(ClearAllStateCommandMessage::ty())),
-        }
+        )
     }
 }
 
